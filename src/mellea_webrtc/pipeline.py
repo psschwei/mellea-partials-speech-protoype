@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from typing import Any
 
 import av
@@ -140,14 +141,18 @@ class AudioPipeline:
 
     async def _process_utterance(self, audio: torch.Tensor) -> None:
         self._busy = True
+        t_utterance = time.perf_counter()
         try:
             # STT
             text = await self._stt.transcribe(audio)
+            t_stt_done = time.perf_counter()
+            stt_ms = (t_stt_done - t_utterance) * 1000
             if not text:
                 logger.debug("Empty transcription, skipping")
                 self._emit("stt_empty")
                 return
             self._emit("stt_result", text=text)
+            logger.info("TIMING  STT: %.0fms  | %r", stt_ms, text)
 
             # LLM → sentence queue
             sentence_queue: asyncio.Queue[str | None] = asyncio.Queue()
@@ -156,14 +161,36 @@ class AudioPipeline:
             self._llm_task = asyncio.ensure_future(self._safe_generate(text, sentence_queue))
 
             # TTS each sentence as it arrives
+            first_sentence = True
+            first_audio_enqueued = False
             while True:
                 sentence = await sentence_queue.get()
                 if sentence is None:
                     break
                 if epoch != self._generation_epoch:
                     break
+
+                if first_sentence:
+                    t_first_sentence = time.perf_counter()
+                    llm_first_sentence_ms = (t_first_sentence - t_utterance) * 1000
+                    llm_only_ms = (t_first_sentence - t_stt_done) * 1000
+                    logger.info(
+                        "TIMING  LLM first sentence: %.0fms (LLM-only: %.0fms)  | %r",
+                        llm_first_sentence_ms, llm_only_ms, sentence,
+                    )
+                    self._emit(
+                        "timing_llm_first_sentence",
+                        elapsed_ms=round(llm_first_sentence_ms, 1),
+                        llm_only_ms=round(llm_only_ms, 1),
+                    )
+                    first_sentence = False
+
                 self._emit("llm_sentence", sentence=sentence)
-                await self._synthesize_and_enqueue(sentence, epoch)
+                await self._synthesize_and_enqueue(
+                    sentence, epoch,
+                    t_utterance=t_utterance if not first_audio_enqueued else None,
+                )
+                first_audio_enqueued = True
 
             self._emit("llm_done")
 
@@ -190,15 +217,51 @@ class AudioPipeline:
             self._llm_result = None
             await sentence_queue.put(None)  # guarantee consumer loop exits
 
-    async def _synthesize_and_enqueue(self, sentence: str, epoch: int) -> None:
+    async def _synthesize_and_enqueue(
+        self, sentence: str, epoch: int, *, t_utterance: float | None = None,
+    ) -> None:
         self._emit("tts_start", sentence=sentence)
-        chunks = await self._tts.synthesize(sentence)
+        tts_result = await self._tts.synthesize(sentence)
         if epoch != self._generation_epoch:
             logger.debug("Stale TTS output discarded (epoch %d != %d)", epoch, self._generation_epoch)
             return
-        if chunks:
-            combined = np.concatenate(chunks)
+
+        # Log TTS-internal timing
+        self._emit(
+            "timing_tts",
+            first_phoneme_ms=round(tts_result.first_phoneme_elapsed_ms, 1),
+            first_audio_ms=round(tts_result.first_audio_elapsed_ms, 1),
+            phoneme=tts_result.first_phoneme or "",
+        )
+        logger.info(
+            "TIMING  TTS: first_phoneme=%.0fms  first_audio=%.0fms  | phoneme=%r",
+            tts_result.first_phoneme_elapsed_ms,
+            tts_result.first_audio_elapsed_ms,
+            tts_result.first_phoneme,
+        )
+
+        if tts_result.chunks:
+            combined = np.concatenate(tts_result.chunks)
             frames = pcm24k_to_webrtc_frames(combined)
             for frame in frames:
                 self._output.enqueue(frame)
+
+        # Time to first phoneme / first word (end-to-end from utterance)
+        if t_utterance is not None:
+            t_now = time.perf_counter()
+            # First phoneme: utterance start → TTS produced first phoneme
+            ttfp_ms = (t_now - t_utterance) * 1000 - tts_result.first_audio_elapsed_ms + tts_result.first_phoneme_elapsed_ms
+            # First word: utterance start → first audio enqueued to WebRTC
+            ttfw_ms = (t_now - t_utterance) * 1000
+            logger.info(
+                "TIMING  Time to first phoneme: %.0fms  |  Time to first word: %.0fms",
+                ttfp_ms, ttfw_ms,
+            )
+            self._emit(
+                "timing_first_phoneme",
+                elapsed_ms=round(ttfp_ms, 1),
+                phoneme=tts_result.first_phoneme or "",
+            )
+            self._emit("timing_first_word", elapsed_ms=round(ttfw_ms, 1))
+
         self._emit("tts_done")
