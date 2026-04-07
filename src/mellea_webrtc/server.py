@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 
 from aiohttp import web
+from aiohttp.web import middleware
 from aiortc import RTCPeerConnection, RTCSessionDescription
 from aiortc.contrib.media import MediaRelay
 
@@ -22,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 HOST = os.environ.get("HOST", "localhost")
 PORT = int(os.environ.get("PORT", "8080"))
+CORS_ORIGIN = os.environ.get("CORS_ORIGIN", "*")
 STATIC_DIR = Path(__file__).parent / "static"
 
 # Track active peer connections for cleanup
@@ -94,10 +96,23 @@ async def on_shutdown(app: web.Application) -> None:
     _peer_connections.clear()
 
 
+@middleware
+async def cors_middleware(request: web.Request, handler):
+    if request.method == "OPTIONS":
+        response = web.Response()
+    else:
+        response = await handler(request)
+    response.headers["Access-Control-Allow-Origin"] = CORS_ORIGIN
+    response.headers["Access-Control-Allow-Methods"] = "POST, GET, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return response
+
+
 def main() -> None:
-    app = web.Application()
+    app = web.Application(middlewares=[cors_middleware])
     app.router.add_get("/", index)
     app.router.add_post("/offer", offer)
+    app.router.add_route("OPTIONS", "/offer", lambda r: web.Response())
     app.on_shutdown.append(on_shutdown)
 
     logger.info("Starting server at http://%s:%d", HOST, PORT)

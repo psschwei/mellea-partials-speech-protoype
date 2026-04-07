@@ -7,6 +7,10 @@ resolution-markers = [
     "python_full_version < '3.13'",
 ]
 
+[options]
+exclude-newer = "2026-03-26T19:20:59.712472Z"
+exclude-newer-span = "P7D"
+
 [[package]]
 name = "absl-py"
 version = "2.4.0"
