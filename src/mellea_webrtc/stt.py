@@ -50,6 +50,33 @@ class WhisperSTT:
         return text
 
 
+class MLXWhisperSTT:
+    """STT backend using mlx-whisper (Apple Silicon accelerated)."""
+
+    def __init__(self, model_repo: str = "mlx-community/whisper-base.en-mlx") -> None:
+        import mlx_whisper
+
+        self._mlx_whisper = mlx_whisper
+        self._model_repo = model_repo
+        logger.info("Loading mlx-whisper model: %s", model_repo)
+
+    async def transcribe(self, audio_16k: torch.Tensor) -> str:
+        loop = asyncio.get_event_loop()
+        audio_np = audio_16k.numpy()
+
+        def _run():
+            result = self._mlx_whisper.transcribe(
+                audio_np,
+                path_or_hf_repo=self._model_repo,
+                language="en",
+            )
+            return result["text"].strip()
+
+        text = await loop.run_in_executor(None, _run)
+        logger.debug("STT: %r", text)
+        return text
+
+
 class GraniteSpeechSTT:
     """STT backend using IBM Granite Speech (CUDA/MPS/CPU)."""
 
@@ -106,4 +133,6 @@ def create_stt_backend() -> STTBackend:
     backend = STT_BACKEND.lower()
     if backend == "granite":
         return GraniteSpeechSTT()
+    if backend == "mlx":
+        return MLXWhisperSTT()
     return WhisperSTT()

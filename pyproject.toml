@@ -30,6 +30,9 @@ granite = [
     "transformers>=4.53.2",
     "accelerate>=0.34",
 ]
+mlx = [
+    "mlx-whisper>=0.4",
+]
 
 [project.scripts]
 mellea-webrtc = "mellea_webrtc.server:main"
