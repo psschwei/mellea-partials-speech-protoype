@@ -11,7 +11,7 @@ import torch
 logger = logging.getLogger(__name__)
 
 STT_BACKEND = os.environ.get("STT_BACKEND", "whisper")
-WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base.en")
 WHISPER_LANGUAGE = os.environ.get("WHISPER_LANGUAGE", "en")
 
 
@@ -39,7 +39,7 @@ class WhisperSTT:
                 audio_np,
                 beam_size=3,
                 language=WHISPER_LANGUAGE,
-                vad_filter=True,
+                vad_filter=False,
             )
             text = " ".join(seg.text.strip() for seg in segments).strip()
             logger.debug("Whisper detected language: %s (%.2f)", info.language, info.language_probability)

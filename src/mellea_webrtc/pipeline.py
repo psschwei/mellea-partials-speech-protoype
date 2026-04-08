@@ -16,12 +16,12 @@ from mellea_webrtc.audio_utils import pcm24k_to_webrtc_frames
 from mellea_webrtc.llm import generate_response
 from mellea_webrtc.stt import create_stt_backend, STTBackend
 from mellea_webrtc.tracks import TTSOutputTrack
-from mellea_webrtc.tts import TextToSpeech
+from mellea_webrtc.tts import TextToSpeech, TTSTimingInfo
 from mellea_webrtc.vad import VoiceActivityDetector
 
 logger = logging.getLogger(__name__)
 
-_RESAMPLE_BUF_SAMPLES = 9600  # 200ms at 48kHz before batch-resampling
+_RESAMPLE_BUF_SAMPLES = 4800  # 100ms at 48kHz before batch-resampling
 _BARGEIN_ENERGY_THRESHOLD = float(os.environ.get("BARGEIN_ENERGY_THRESHOLD", "0.005"))
 _to_mono = av.AudioResampler(format='s16', layout='mono', rate=48000)
 
@@ -66,7 +66,7 @@ class AudioPipeline:
         if total < _RESAMPLE_BUF_SAMPLES:
             return  # keep accumulating
 
-        # Batch-resample 200ms of audio at once to avoid sinc edge artifacts
+        # Batch-resample 100ms of audio at once to avoid sinc edge artifacts
         combined = np.concatenate(self._resample_buf)
         self._resample_buf = []
         float_mono = combined.astype(np.float32) / 32768.0
@@ -221,47 +221,61 @@ class AudioPipeline:
         self, sentence: str, epoch: int, *, t_utterance: float | None = None,
     ) -> None:
         self._emit("tts_start", sentence=sentence)
-        tts_result = await self._tts.synthesize(sentence)
-        if epoch != self._generation_epoch:
-            logger.debug("Stale TTS output discarded (epoch %d != %d)", epoch, self._generation_epoch)
-            return
+
+        audio_queue: asyncio.Queue[np.ndarray | None] = asyncio.Queue()
+        timing = TTSTimingInfo()
+
+        # Start synthesis in background — chunks arrive on audio_queue
+        synth_task = asyncio.ensure_future(
+            self._tts.synthesize_streaming(sentence, audio_queue, timing)
+        )
+
+        first_audio_enqueued = False
+        try:
+            while True:
+                chunk = await audio_queue.get()
+                if chunk is None:
+                    break
+                if epoch != self._generation_epoch:
+                    logger.debug("Stale TTS output discarded (epoch %d != %d)", epoch, self._generation_epoch)
+                    synth_task.cancel()
+                    return
+
+                frames = pcm24k_to_webrtc_frames(chunk)
+                for frame in frames:
+                    self._output.enqueue(frame)
+
+                if not first_audio_enqueued:
+                    first_audio_enqueued = True
+                    # Log TTFW at the moment we enqueue the very first audio
+                    if t_utterance is not None:
+                        t_now = time.perf_counter()
+                        ttfp_ms = (t_now - t_utterance) * 1000 - timing.first_audio_elapsed_ms + timing.first_phoneme_elapsed_ms
+                        ttfw_ms = (t_now - t_utterance) * 1000
+                        logger.info(
+                            "TIMING  Time to first phoneme: %.0fms  |  Time to first word: %.0fms",
+                            ttfp_ms, ttfw_ms,
+                        )
+                        self._emit(
+                            "timing_first_phoneme",
+                            elapsed_ms=round(ttfp_ms, 1),
+                            phoneme=timing.first_phoneme or "",
+                        )
+                        self._emit("timing_first_word", elapsed_ms=round(ttfw_ms, 1))
+        finally:
+            await synth_task
 
         # Log TTS-internal timing
         self._emit(
             "timing_tts",
-            first_phoneme_ms=round(tts_result.first_phoneme_elapsed_ms, 1),
-            first_audio_ms=round(tts_result.first_audio_elapsed_ms, 1),
-            phoneme=tts_result.first_phoneme or "",
+            first_phoneme_ms=round(timing.first_phoneme_elapsed_ms, 1),
+            first_audio_ms=round(timing.first_audio_elapsed_ms, 1),
+            phoneme=timing.first_phoneme or "",
         )
         logger.info(
             "TIMING  TTS: first_phoneme=%.0fms  first_audio=%.0fms  | phoneme=%r",
-            tts_result.first_phoneme_elapsed_ms,
-            tts_result.first_audio_elapsed_ms,
-            tts_result.first_phoneme,
+            timing.first_phoneme_elapsed_ms,
+            timing.first_audio_elapsed_ms,
+            timing.first_phoneme,
         )
-
-        if tts_result.chunks:
-            combined = np.concatenate(tts_result.chunks)
-            frames = pcm24k_to_webrtc_frames(combined)
-            for frame in frames:
-                self._output.enqueue(frame)
-
-        # Time to first phoneme / first word (end-to-end from utterance)
-        if t_utterance is not None:
-            t_now = time.perf_counter()
-            # First phoneme: utterance start → TTS produced first phoneme
-            ttfp_ms = (t_now - t_utterance) * 1000 - tts_result.first_audio_elapsed_ms + tts_result.first_phoneme_elapsed_ms
-            # First word: utterance start → first audio enqueued to WebRTC
-            ttfw_ms = (t_now - t_utterance) * 1000
-            logger.info(
-                "TIMING  Time to first phoneme: %.0fms  |  Time to first word: %.0fms",
-                ttfp_ms, ttfw_ms,
-            )
-            self._emit(
-                "timing_first_phoneme",
-                elapsed_ms=round(ttfp_ms, 1),
-                phoneme=tts_result.first_phoneme or "",
-            )
-            self._emit("timing_first_word", elapsed_ms=round(ttfw_ms, 1))
-
         self._emit("tts_done")

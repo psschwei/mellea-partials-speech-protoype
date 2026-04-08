@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 VAD_SAMPLE_RATE = 16000
 VAD_WINDOW_SAMPLES = 512          # ~32ms at 16kHz (silero requires 512 or 256)
-SILENCE_THRESHOLD_SAMPLES = 9600  # 600ms at 16kHz
+SILENCE_THRESHOLD_SAMPLES = 5600  # 350ms at 16kHz
 MIN_UTTERANCE_SAMPLES = 4000      # 250ms at 16kHz
 
 

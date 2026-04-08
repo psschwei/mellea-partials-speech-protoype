@@ -23,6 +23,14 @@ class TTSResult:
     first_audio_elapsed_ms: float      # ms from synthesis start to first audio chunk
 
 
+@dataclass
+class TTSTimingInfo:
+    """Timing info sent alongside streamed audio chunks."""
+    first_phoneme: str | None = None
+    first_phoneme_elapsed_ms: float = 0.0
+    first_audio_elapsed_ms: float = 0.0
+
+
 class TextToSpeech:
     """Kokoro TTS: synthesizes text to 24kHz float32 numpy audio."""
 
@@ -70,3 +78,41 @@ class TextToSpeech:
             result.first_phoneme_elapsed_ms, result.first_audio_elapsed_ms,
         )
         return result
+
+    async def synthesize_streaming(
+        self, text: str, audio_queue: asyncio.Queue[np.ndarray | None],
+        timing_info: TTSTimingInfo,
+    ) -> None:
+        """Synthesize text, pushing each audio chunk to audio_queue as it arrives.
+
+        Puts None as sentinel when synthesis is complete.
+        Populates timing_info in-place with first-phoneme/first-audio timings.
+        """
+        loop = asyncio.get_event_loop()
+
+        def _run():
+            t_start = time.perf_counter()
+            chunk_count = 0
+
+            generator = self._pipeline(text, voice=self._voice, speed=1.0)
+            for graphemes, phonemes, audio in generator:
+                if timing_info.first_phoneme is None and phonemes:
+                    timing_info.first_phoneme = phonemes
+                    timing_info.first_phoneme_elapsed_ms = (time.perf_counter() - t_start) * 1000
+                if audio is not None and len(audio) > 0:
+                    if chunk_count == 0:
+                        timing_info.first_audio_elapsed_ms = (time.perf_counter() - t_start) * 1000
+                    if hasattr(audio, "numpy"):
+                        audio = audio.numpy()
+                    # Thread-safe: put_nowait from executor thread, consumed on event loop
+                    loop.call_soon_threadsafe(audio_queue.put_nowait, audio)
+                    chunk_count += 1
+
+            loop.call_soon_threadsafe(audio_queue.put_nowait, None)
+            logger.debug(
+                "TTS streamed %d chunk(s) for %r  [first_phoneme=%.1fms  first_audio=%.1fms]",
+                chunk_count, text[:40],
+                timing_info.first_phoneme_elapsed_ms, timing_info.first_audio_elapsed_ms,
+            )
+
+        await loop.run_in_executor(None, _run)

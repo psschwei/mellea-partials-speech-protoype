@@ -11,7 +11,8 @@ from mellea.stdlib.components.instruction import Instruction
 from mellea.core.requirement import Requirement, ValidationResult
 from mellea.stdlib.context import SimpleContext
 
-from mellea_partial import ChunkingMode, StreamChunkingResult, stream_with_chunking
+from mellea_partial import StreamChunkingResult, stream_with_chunking
+from mellea_partial.chunking import ChunkingStrategy
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,37 @@ SYSTEM_PROMPT = (
     "Keep responses concise — typically 2-4 sentences. "
     "Avoid markdown, bullet points, or numbered lists; use plain prose only."
 )
+
+
+_CLAUSE_SPLIT = re.compile(r"(?<=[,;:\-\u2014.!?])(?=\s+)")
+_MIN_CLAUSE_LEN = 20
+
+
+class ClauseChunking(ChunkingStrategy):
+    """Splits on clause boundaries (commas, semicolons, dashes, sentence-end).
+
+    Merges fragments shorter than _MIN_CLAUSE_LEN into the next chunk so that
+    TTS receives reasonably-sized phrases rather than single words.
+    """
+
+    def split(self, text: str) -> list[str]:
+        raw = _CLAUSE_SPLIT.split(text)
+        if len(raw) <= 1:
+            return raw
+
+        merged: list[str] = []
+        buf = ""
+        for part in raw:
+            buf += part
+            if len(buf) >= _MIN_CLAUSE_LEN:
+                merged.append(buf)
+                buf = ""
+        if buf:
+            if merged:
+                merged[-1] += buf
+            else:
+                merged.append(buf)
+        return merged
 
 
 class MarkdownFreeRequirement(Requirement):
@@ -73,6 +105,39 @@ class GuardianRequirement(Requirement):
             return ValidationResult(result=True)
 
 
+class DeferredGuardianRequirement(Requirement):
+    """Wraps GuardianRequirement but skips the check for the first chunk.
+
+    The first chunk passes through immediately for lower TTFW. Guardian runs
+    on the first chunk asynchronously (fire-and-forget, logs a warning on failure).
+    Subsequent chunks are checked synchronously as before.
+    """
+
+    def __init__(self):
+        super().__init__(
+            description="Deferred guardian: skip first chunk, check rest.",
+            check_only=True,
+        )
+        self._inner = GuardianRequirement()
+        self._chunk_count = 0
+
+    async def validate(self, backend, ctx, *, format=None, model_options=None):
+        self._chunk_count += 1
+        if self._chunk_count == 1:
+            # Fire-and-forget Guardian on the first chunk
+            asyncio.ensure_future(self._async_check_first(backend, ctx, format=format, model_options=model_options))
+            return ValidationResult(result=True)
+        return await self._inner.validate(backend, ctx, format=format, model_options=model_options)
+
+    async def _async_check_first(self, backend, ctx, *, format=None, model_options=None):
+        try:
+            result = await self._inner.validate(backend, ctx, format=format, model_options=model_options)
+            if not result.result:
+                logger.warning("Deferred Guardian: first chunk FAILED check (already sent to TTS)")
+        except Exception:
+            logger.warning("Deferred Guardian: first chunk check errored", exc_info=True)
+
+
 def _make_backend() -> OpenAIBackend:
     return OpenAIBackend(
         model_id=LM_STUDIO_MODEL,
@@ -104,8 +169,8 @@ async def generate_response(user_text: str, sentence_queue: asyncio.Queue[str | 
         instruction,
         backend,
         ctx,
-        chunking=ChunkingMode.SENTENCE,
-        quick_check_requirements=[GuardianRequirement(), MarkdownFreeRequirement()],
+        chunking=ClauseChunking(),
+        quick_check_requirements=[DeferredGuardianRequirement(), MarkdownFreeRequirement()],
         quick_repair=on_failure,
     )
 
