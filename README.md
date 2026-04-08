@@ -47,10 +47,23 @@ uv sync
 # 2. Start LM Studio and load a model, then enable the local server (default: http://localhost:1234)
 
 # 3. Start the server
-mellea-webrtc
-# or: uv run mellea-webrtc
+uv run mellea-webrtc
 
 # 4. Open http://localhost:8080 in your browser, click Start, and speak
+```
+
+### macOS (Apple Silicon) with MLX backend
+
+For faster STT on Apple Silicon, use the MLX Whisper backend with espeak-ng data path:
+
+```bash
+ESPEAK_DATA_PATH=/opt/homebrew/share/espeak-ng-data STT_BACKEND=mlx DEBUG=1 uv run mellea-webrtc
+```
+
+### Minimal (CPU Whisper, default)
+
+```bash
+uv run mellea-webrtc
 ```
 
 ## LM Studio Setup
@@ -123,20 +136,51 @@ mellea-partial-webrtc/
 
 All options are set via environment variables:
 
+### Server
+
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `STT_BACKEND` | `whisper` | `whisper` or `granite` |
-| `WHISPER_MODEL` | `base` | `base`, `small`, or `medium` |
+| `HOST` | `localhost` | Server bind address |
+| `PORT` | `8080` | Server port |
+| `CORS_ORIGIN` | `*` | CORS allowed origin |
+| `DEBUG` | *(unset)* | Set to any value (e.g. `1`) to enable DEBUG-level logging |
+
+### Speech-to-Text
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `STT_BACKEND` | `whisper` | `whisper` (CPU), `mlx` (Apple Silicon), or `granite` (CUDA GPU) |
+| `WHISPER_MODEL` | `base.en` | Whisper model size (`base.en`, `small`, `medium`, etc.) |
+| `WHISPER_LANGUAGE` | `en` | Language code for Whisper transcription |
+| `GRANITE_MODEL` | `ibm-granite/granite-4.0-1b-speech` | HuggingFace model ID (when `STT_BACKEND=granite`) |
+
+### LLM
+
+| Variable | Default | Description |
+|----------|---------|-------------|
 | `LM_STUDIO_URL` | `http://localhost:1234/v1` | LM Studio OpenAI-compatible endpoint |
 | `LM_STUDIO_MODEL` | `granite-4.0-micro@q8_0` | Model name as shown in LM Studio |
-| `TTS_VOICE` | `bf_emma` | Kokoro voice (British English `bf_*` voices) |
-| `HOST` | `0.0.0.0` | Server bind address |
-| `PORT` | `8080` | Server port |
+| `GUARDIAN_MODEL` | `granite-guardian-3.3-8b` | Model used for output safety validation |
 
-Example with custom settings:
+### TTS & Audio
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TTS_VOICE` | `bf_emma` | Kokoro voice (British English `bf_*` voices) |
+| `ESPEAK_DATA_PATH` | *(system default)* | Path to espeak-ng data; required on macOS Homebrew (see [note below](#notes)) |
+| `BARGEIN_ENERGY_THRESHOLD` | `0.005` | Audio energy threshold for barge-in (interrupt) detection |
+
+### Examples
 
 ```bash
-LM_STUDIO_MODEL="llama-3.2-3b" WHISPER_MODEL="small" mellea-webrtc
+# Apple Silicon with MLX Whisper + debug logging
+ESPEAK_DATA_PATH=/opt/homebrew/share/espeak-ng-data STT_BACKEND=mlx DEBUG=1 uv run mellea-webrtc
+
+# Custom LLM model with smaller Whisper
+LM_STUDIO_MODEL="llama-3.2-3b" WHISPER_MODEL="small" uv run mellea-webrtc
+
+# Granite Speech backend (requires CUDA GPU)
+STT_BACKEND=granite uv run mellea-webrtc
 ```
 
 ## STT Backends
@@ -146,7 +190,15 @@ LM_STUDIO_MODEL="llama-3.2-3b" WHISPER_MODEL="small" mellea-webrtc
 Uses [faster-whisper](https://github.com/SYSTRAN/faster-whisper), runs on CPU, no GPU required.
 
 ```bash
-STT_BACKEND=whisper mellea-webrtc
+STT_BACKEND=whisper uv run mellea-webrtc
+```
+
+### MLX Whisper (Apple Silicon)
+
+Uses MLX-optimized Whisper for fast inference on Apple Silicon Macs.
+
+```bash
+STT_BACKEND=mlx uv run mellea-webrtc
 ```
 
 ### Granite Speech (optional)
@@ -155,7 +207,7 @@ Uses IBM Granite Speech via `transformers`. Requires a CUDA GPU and additional d
 
 ```bash
 uv sync --extra granite
-STT_BACKEND=granite mellea-webrtc
+STT_BACKEND=granite uv run mellea-webrtc
 ```
 
 Set `GRANITE_MODEL` to override the default model (e.g. `ibm-granite/granite-speech-3.3-8b`).
