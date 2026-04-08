@@ -26,15 +26,30 @@ _BARGEIN_ENERGY_THRESHOLD = float(os.environ.get("BARGEIN_ENERGY_THRESHOLD", "0.
 _to_mono = av.AudioResampler(format='s16', layout='mono', rate=48000)
 
 
+class PipelineModels:
+    """Shared model instances loaded once at server startup."""
+
+    def __init__(self) -> None:
+        logger.info("Loading pipeline models (STT, TTS, VAD)...")
+        self.stt: STTBackend = create_stt_backend()
+        self.tts = TextToSpeech()
+        # VAD is lightweight but stateful, so each pipeline gets its own
+        logger.info("Pipeline models loaded.")
+
+
 class AudioPipeline:
     """Wires together VAD, STT, LLM, TTS and feeds audio to the output track."""
 
-    def __init__(self, output_track: TTSOutputTrack, log_channel: Any = None) -> None:
+    def __init__(self, output_track: TTSOutputTrack, log_channel: Any = None, *, models: PipelineModels | None = None) -> None:
         self._output = output_track
         self._log_channel = log_channel
-        self._stt: STTBackend = create_stt_backend()
-        self._tts = TextToSpeech()
-        self._vad = VoiceActivityDetector(on_utterance=None)  # sync push API
+        if models:
+            self._stt = models.stt
+            self._tts = models.tts
+        else:
+            self._stt: STTBackend = create_stt_backend()
+            self._tts = TextToSpeech()
+        self._vad = VoiceActivityDetector(on_utterance=None)  # stateful per-connection
         self._busy = False  # process one utterance at a time
         self._resample_buf: list[np.ndarray] = []  # accumulated int16 mono at 48kHz
         self._generation_task: asyncio.Task | None = None
@@ -43,19 +58,27 @@ class AudioPipeline:
         self._generation_epoch: int = 0
 
     def _emit(self, event: str, **data) -> None:
+        payload = {"event": event, **data}
+        logger.debug("[pipeline:emit] %s %s", event, {k: v for k, v in data.items() if k != "content"})
         if not self._log_channel:
+            logger.debug("[pipeline:emit] No log channel, dropping: %s", event)
             return
         if self._log_channel.readyState != "open":
             logger.debug(
-                "Log channel not open (state=%s), dropping: %s",
+                "[pipeline:emit] Log channel not open (state=%s), dropping: %s",
                 self._log_channel.readyState,
                 event,
             )
             return
-        self._log_channel.send(json.dumps({"event": event, **data}))
+        self._log_channel.send(json.dumps(payload))
+
+    _feed_count: int = 0
 
     def feed_audio(self, frame: av.AudioFrame) -> None:
         """Called with each incoming WebRTC audio frame from the browser mic."""
+        self._feed_count += 1
+        if self._feed_count == 1:
+            logger.debug("[pipeline:feed] First audio frame received")
         # Extract int16 mono samples at 48kHz into the buffer
         out_frames = _to_mono.resample(frame)
         arr = out_frames[0].to_ndarray()  # (1, 960) — true mono
@@ -142,19 +165,22 @@ class AudioPipeline:
     async def _process_utterance(self, audio: torch.Tensor) -> None:
         self._busy = True
         t_utterance = time.perf_counter()
+        logger.info("[pipeline] _process_utterance started, audio shape=%s, duration=%.2fs", audio.shape, audio.shape[-1] / 16000)
         try:
             # STT
+            logger.debug("[pipeline] Starting STT transcription...")
             text = await self._stt.transcribe(audio)
             t_stt_done = time.perf_counter()
             stt_ms = (t_stt_done - t_utterance) * 1000
             if not text:
-                logger.debug("Empty transcription, skipping")
+                logger.debug("[pipeline] Empty transcription, skipping")
                 self._emit("stt_empty")
                 return
             self._emit("stt_result", text=text)
-            logger.info("TIMING  STT: %.0fms  | %r", stt_ms, text)
+            logger.info("[pipeline] TIMING  STT: %.0fms  | %r", stt_ms, text)
 
             # LLM → sentence queue
+            logger.debug("[pipeline] Starting LLM generation for: %r", text[:100])
             sentence_queue: asyncio.Queue[str | None] = asyncio.Queue()
             self._emit("llm_start", prompt=text)
             epoch = self._generation_epoch
@@ -195,12 +221,14 @@ class AudioPipeline:
             self._emit("llm_done")
 
         except asyncio.CancelledError:
-            logger.debug("_process_utterance cancelled (barge-in)")
+            logger.debug("[pipeline] _process_utterance cancelled (barge-in)")
             return
         except Exception as exc:
-            logger.exception("Pipeline error")
+            logger.exception("[pipeline] Pipeline error")
             self._emit("pipeline_error", error=str(exc))
         finally:
+            elapsed = (time.perf_counter() - t_utterance) * 1000
+            logger.info("[pipeline] _process_utterance finished in %.0fms", elapsed)
             self._busy = False
 
     async def _safe_generate(self, text: str, sentence_queue: asyncio.Queue) -> None:
